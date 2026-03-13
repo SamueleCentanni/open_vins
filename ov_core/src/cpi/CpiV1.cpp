@@ -43,10 +43,15 @@ void CpiV1::feed_IMU(double t_0, double t_1, Eigen::Matrix<double, 3, 1> w_m_0, 
   }
 
   // Get estimated imu readings
-  Eigen::Matrix<double, 3, 1> w_hat = w_m_0 - b_w_lin;
-  Eigen::Matrix<double, 3, 1> a_hat = a_m_0 - b_a_lin;
+  // w_m_0 and a_m_0 are the initial IMU measurements, while b_w_lin and b_a_lin are the current estimates of the gyro and accel biases, respectively. 
+  // The code computes bias-corrected IMU measurements (w_hat and a_hat) by subtracting the bias estimates from the raw measurements. 
+
+  Eigen::Matrix<double, 3, 1> w_hat = w_m_0 - b_w_lin; // angular velocity
+  Eigen::Matrix<double, 3, 1> a_hat = a_m_0 - b_a_lin; // acceleration
 
   // If averaging, average
+  // If imu_avg is true, it also incorporates the second set of IMU measurements (w_m_1 and a_m_1) to compute an average measurement, 
+  // which can help reduce noise in the estimates.
   if (imu_avg) {
     w_hat += w_m_1 - b_w_lin;
     w_hat = 0.5 * w_hat;
@@ -83,26 +88,43 @@ void CpiV1::feed_IMU(double t_0, double t_1, Eigen::Matrix<double, 3, 1> w_m_0, 
   // MEASUREMENT MEANS
   //==========================================================================
 
-  // Get relative rotation
-  Eigen::Matrix<double, 3, 3> R_tau2tau1 = small_w ? eye3 - delta_t * w_x + (pow(delta_t, 2) / 2) * w_x_2
-                                                   : eye3 - (sin_wt / mag_w) * w_x + ((1.0 - cos_wt) / (pow(mag_w, 2.0))) * w_x_2;
+  // Get relative rotation between two time steps
+  // small_w is a boolean variable that checks if the magnitude of the angular velocity (mag_w) is below a certain threshold (0.008726646 radians per second, which is approximately 0.5 degrees per second).
+  // 1. Calculate the relative rotation increment using the closed-form Rodrigues' formula.
+  // use a conditional check (small_w) to prevent numerical instability (division by zero) 
+  // when the angular velocity magnitude is near zero.
+  Eigen::Matrix<double, 3, 3> R_tau2tau1 = small_w ? 
+      // Taylor series expansion for small angular velocities (Small Angle Approximation)
+      eye3 - delta_t * w_x + (pow(delta_t, 2) / 2) * w_x_2 : 
+      // General case: Exponential map from so(3) to SO(3)
+      eye3 - (sin_wt / mag_w) * w_x + ((1.0 - cos_wt) / (pow(mag_w, 2.0))) * w_x_2;
 
-  // Updated rotation and its transpose
+  // 2. Update the integrated rotation from the start of the preintegration period (k) to the current time (tau1).
+  // R_k2tau1 = R_{tau2<-tau1} * R_{tau1<-k}
   Eigen::Matrix<double, 3, 3> R_k2tau1 = R_tau2tau1 * R_k2tau;
+  
+  // 3. Store the transpose (inverse rotation) for transforming IMU measurements 
+  // from the current local frame to the preintegration reference frame.
   Eigen::Matrix<double, 3, 3> R_tau12k = R_k2tau1.transpose();
 
-  // Intermediate variables for evaluating the measurement/bias Jacobian update
+  // 4. Define intermediate coefficients f_1 to f_4.
+  // These coefficients represent the first and second integrals of the rotation matrix 
+  // over the interval delta_t, used to update position (alpha) and velocity (beta).
   double f_1;
   double f_2;
   double f_3;
   double f_4;
 
   if (small_w) {
+    // Limits of the transcendental functions as angular velocity approaches zero.
+    // use taylor series expansions for the coefficients to avoid numerical instability when the angular velocity is small.
     f_1 = -(pow(delta_t, 3) / 3);
     f_2 = (pow(delta_t, 4) / 8);
     f_3 = -(pow(delta_t, 2) / 2);
     f_4 = (pow(delta_t, 3) / 6);
   } else {
+    // Closed-form analytical solutions for the integration of the motion 
+    // assuming constant angular velocity and constant acceleration in the interval.
     f_1 = (w_dt * cos_wt - sin_wt) / (pow(mag_w, 3));
     f_2 = (pow(w_dt, 2) - 2 * cos_wt - 2 * w_dt * sin_wt + 2) / (2 * pow(mag_w, 4));
     f_3 = -(1 - cos_wt) / pow(mag_w, 2);
@@ -118,6 +140,8 @@ void CpiV1::feed_IMU(double t_0, double t_1, Eigen::Matrix<double, 3, 1> w_m_0, 
   Eigen::MatrixXd H_be = R_tau12k * Beta_arg;
 
   // Update the measurement means
+  // alpha_tau is the position-like preintegration term that captures the effect of the accelerations between the two poses on the position, 
+  // while beta_tau is the velocity-like preintegration term that captures the effect of the accelerations between the two poses on the velocity.
   alpha_tau += beta_tau * delta_t + H_al * a_hat;
   beta_tau += H_be * a_hat;
 
@@ -125,15 +149,18 @@ void CpiV1::feed_IMU(double t_0, double t_1, Eigen::Matrix<double, 3, 1> w_m_0, 
   // BIAS JACOBIANS (ANALYTICAL)
   //==========================================================================
 
+  // objective: compute the Jacobians wrt to the unkowns gyro bias (J_q) and accel bias (J_a and J_b) of the preintegrated measurements alpha_tau and beta_tau.
+  // in this way, if the biases change, we can efficiently update the preintegrated measurements without having to reprocess all the IMU readings.
+
   // Get right Jacobian
   Eigen::Matrix<double, 3, 3> J_r_tau1 =
       small_w ? eye3 - .5 * w_tx + (1.0 / 6.0) * w_tx * w_tx
               : eye3 - ((1 - cos_wt) / (pow((w_dt), 2.0))) * w_tx + ((w_dt - sin_wt) / (pow(w_dt, 3.0))) * w_tx * w_tx;
 
-  // Update orientation in respect to gyro bias Jacobians
+  // Update orientation wrt gyro bias Jacobians
   J_q = R_tau2tau1 * J_q + J_r_tau1 * delta_t;
 
-  // Update alpha and beta in respect to accel bias Jacobians
+  // Update alpha and beta wrt accel bias Jacobians
   H_a -= H_al;
   H_a += delta_t * H_b;
   H_b -= H_be;

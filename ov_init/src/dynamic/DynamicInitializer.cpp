@@ -55,21 +55,26 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       }
     }
   }
-  double oldest_time = newest_cam_time - params.init_window_time;
+  
+  // oldest_time defines the start of the sliding window used for initialization.
+  //  ====== The code collects visual measurements inside [oldest_time, newest_cam_time] ======
+  // and corresponding IMU samples for preintegration. This windowing ensures
+  // the problem stays small and that features are temporally distributed.
+  double oldest_time = newest_cam_time - params.init_window_time; // in my config is 1.5 or 2.5 seconds
   if (newest_cam_time < 0 || oldest_time < 0) {
     return false;
   }
 
   // Remove all measurements that are older than our initialization window
   // Then we will try to use all features that are in the feature database!
-  _db->cleanup_measurements(oldest_time);
+  _db->cleanup_measurements(oldest_time); // Remove all measurements that are older than our initialization window
   bool have_old_imu_readings = false;
-  auto it_imu = imu_data->begin();
+  auto it_imu = imu_data->begin(); 
   while (it_imu != imu_data->end() && it_imu->timestamp < oldest_time + params.calib_camimu_dt) {
     have_old_imu_readings = true;
-    it_imu = imu_data->erase(it_imu);
+    it_imu = imu_data->erase(it_imu); // remove params calib_camimu_dt seconds of IMU data before the oldest camera time, since we will need this for preintegration
   }
-  if (_db->get_internal_data().size() < 0.75 * params.init_max_features) {
+  if (_db->get_internal_data().size() < 0.75 * params.init_max_features) { // in my config is 50
     PRINT_WARNING(RED "[init-d]: only %zu valid features of required (%.0f thresh)!!\n" RESET, _db->get_internal_data().size(),
                   0.95 * params.init_max_features);
     return false;
@@ -109,7 +114,13 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   std::map<double, bool> map_camera_times;
   map_camera_times[newest_cam_time] = true; // always insert final pose
   std::map<size_t, bool> map_camera_ids;
+
+  // params.init_window_time = total time length of the initialization window 
+  // params.init_dyn_num_pose = number of poses we want to sample within the window (i.e. 6)
+  // pose_dt_avg = average time between these sampled poses, which we will use to ensure that the features we use are well distributed in time
   double pose_dt_avg = params.init_window_time / (double)(params.init_dyn_num_pose + 1);
+
+
   for (auto const &feat : features) {
 
     // Loop through each timestamp and make sure it is a valid pose
@@ -155,7 +166,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
 
   // Return if we do not have our full window or not enough measurements
   // Also check that we have enough features to initialize with
-  if ((int)map_camera_times.size() < params.init_dyn_num_pose) {
+  if ((int)map_camera_times.size() < params.init_dyn_num_pose) { // 6 in my config file 
     return false;
   }
   if (count_valid_features < min_valid_features) {
@@ -176,6 +187,8 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   double time1_in_imu = newest_cam_time + params.calib_camimu_dt;
   std::vector<ov_core::ImuData> readings = InitializerHelper::select_imu_readings(*imu_data, time0_in_imu, time1_in_imu);
   assert(readings.size() > 2);
+
+  // iterate through IMU readings between the first and consecutive camera time (with offset) and compute the total angle change and average accel magnitude
   for (size_t k = 0; k < readings.size() - 1; k++) {
     auto imu0 = readings.at(k);
     auto imu1 = readings.at(k + 1);
@@ -186,6 +199,8 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     accel_inI_norm += am.norm();
   }
   accel_inI_norm /= (double)(readings.size() - 1);
+
+  // define if the motion is sufficient for initialization
   if (180.0 / M_PI * theta_inI_norm < params.init_dyn_min_deg) {
     PRINT_WARNING(YELLOW "[init-d]: gyroscope only %.2f degree change (%.2f thresh)\n" RESET, 180.0 / M_PI * theta_inI_norm,
                   params.init_dyn_min_deg);
@@ -216,20 +231,22 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   //    features_bearings.insert({feat->featid, bearing});
   //    features_index.insert({feat->featid, (int)features_index.size()});
   //  }
+  // rT2 marks the time after basic checks (feature counts, imu motion) are done.
   auto rT2 = boost::posix_time::microsec_clock::local_time();
 
   // ======================================================
   // ======================================================
 
-  // We will recover position of feature, velocity, gravity
-  // Based on Equation (14) in the following paper:
-  // https://ieeexplore.ieee.org/abstract/document/6386235
-  // State ordering is: [features, velocity, gravity]
-  // Feature size of 1 will use the first ever bearing of the feature as true (depth only..)
+  // We will recover position of features, the initial IMU velocity in I0, and gravity.
+  // This follows the closed-form / linear approach (see Eq. (14) in the cited paper)
+  // The unknown state vector is ordered as: x = [p_F1, p_F2, ..., v_I0, g]
+  // where each p_F is a 3D feature position in the first IMU frame (I0).
+  // Solving starts with a linear system built from image reprojection constraints
+  // and IMU preintegration terms; gravity is enforced with a magnitude constraint.
   const bool use_single_depth = false;
   int size_feature = (use_single_depth) ? 1 : 3;
   int num_features = count_valid_features;
-  int system_size = size_feature * num_features + 3 + 3;
+  int system_size = size_feature * num_features + 3 + 3; // features (size_feature * num_features) + velocity (3) + gravity (3)
 
   // Make sure we have enough measurements to fully constrain the system
   if (num_measurements < system_size) {
@@ -238,6 +255,8 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   }
 
   // Now lets pre-integrate from the first time to the last
+  // pre integreation gives us the relative pose change between each camera time, which we will use in the linear system and the mle optimization
+  // it is a way to "summarize" what happened between each camera time in terms of the IMU measurements, so we don't have to loop through all the IMU measurements in the optimization
   assert(oldest_camera_time < newest_cam_time);
   double last_camera_timestamp = 0.0;
   std::map<double, std::shared_ptr<ov_core::CpiV1>> map_camera_cpi_I0toIi, map_camera_cpi_IitoIi1;
@@ -253,6 +272,12 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     }
 
     // Perform our preintegration from I0 to Ii (used in the linear system)
+    // The preintegrator accumulates IMU increments to produce compact terms:
+    //  - DT: total time between frames
+    //  - R_k2tau (R_I0->Ii): relative rotation (used to rotate bearings) -> rotation between two consecutive poses
+    //  - alpha_tau: position-like preintegration term (integral of rotated accelerations) -> position change between two consecutive poses if we assume zero velocity and gravity, thus captures the effect of the accelerations between the two poses
+    //  - beta_tau: velocity-like preintegration term -> velocity change between two consecutive poses if we assume zero gravity, thus captures the effect of the accelerations between the two poses on the velocity
+    // These quantities allow linear equations that relate p_F, v_I0 and g without looping over every IMU sample.
     double cpiI0toIi1_time0_in_imu = oldest_camera_time + params.calib_camimu_dt;
     double cpiI0toIi1_time1_in_imu = current_time + params.calib_camimu_dt;
     auto cpiI0toIi1 = std::make_shared<ov_core::CpiV1>(params.sigma_w, params.sigma_wb, params.sigma_a, params.sigma_ab, true);
@@ -347,22 +372,31 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
         Eigen::MatrixXd R_I0toIk = Eigen::MatrixXd::Identity(3, 3);
         Eigen::MatrixXd alpha_I0toIk = Eigen::MatrixXd::Zero(3, 1);
         if (map_camera_cpi_I0toIi.find(time) != map_camera_cpi_I0toIi.end() && map_camera_cpi_I0toIi.at(time) != nullptr) {
+          // pre integration from I0 to Ii, used in the linear system
           DT = map_camera_cpi_I0toIi.at(time)->DT;
           R_I0toIk = map_camera_cpi_I0toIi.at(time)->R_k2tau;
           alpha_I0toIk = map_camera_cpi_I0toIi.at(time)->alpha_tau;
         }
 
-        // Create the linear system based on the feature reprojection
-        // [ 1 0 -u ] p_FinCi = [ 0 ]
-        // [ 0 1 -v ]           [ 0 ]
-        // where
-        // p_FinCi = R_C0toCi * R_ItoC * (p_FinI0 - p_IiinI0) + p_IinC
-        //         = R_C0toCi * R_ItoC * (p_FinI0 - v_I0inI0 * dt - 0.5 * grav_inI0 * dt^2 - alpha) + p_IinC
+        // Create the linear system based on the feature reprojection:
+
+        // For a normalized pixel (u,v) we have x/z = u and y/z = v (in this way we don't need the depth z), which can be written
+        // as H_proj * p_F^{C_i} = 0 where H_proj = [[1,0,-u],[0,1,-v]] and p_F^{C_i} = [x, y, z]^T is the position of the feature in the camera frame at time i. 
+        // We can express p_F^{C_i} in terms of the feature position in I0 (p_F), the initial velocity (v_I0) and gravity (g) using the preintegration terms, 
+        // which gives us a linear equation in these unknowns (namely p_F, v_I0, g). Stacking these equations for all measurements gives us a linear system A x = b, 
+        // where x contains the unknown feature positions, initial velocity, and gravity.
+
+        // Substituting the expression of p_F^{C_i} in terms of the feature in I0,
+        // the initial velocity v_I0 and gravity g (and the preintegration term alpha)
+        // yields a linear equation in the unknowns [p_F, v_I0, g], where p_F=position frame F, v_I0=initial velocity, g=gravity. The code builds
+        // the 2×system_size (system_size = number of observations) matrix A and b.
         Eigen::MatrixXd H_proj = Eigen::MatrixXd::Zero(2, 3);
-        H_proj << 1, 0, -uv_norm(0), 0, 1, -uv_norm(1);
-        Eigen::MatrixXd Y = H_proj * R_ItoC * R_I0toIk;
-        Eigen::MatrixXd H_i = Eigen::MatrixXd::Zero(2, system_size);
-        Eigen::MatrixXd b_i = Y * alpha_I0toIk - H_proj * p_IinC;
+        H_proj << 1, 0, -uv_norm(0), 0, 1, -uv_norm(1); // H_proj = [[1,0,-u],[0,1,-v]].
+
+        // formula: Hproj​⋅RI→C​⋅RI0​→Ii​​(PI0​−vI0​​Δt−21​gΔt2)…=Hproj​⋅pIinC​
+        Eigen::MatrixXd Y = H_proj * R_ItoC * R_I0toIk; // maps I0-frame points into the 2D reprojection constraint
+        Eigen::MatrixXd H_i = Eigen::MatrixXd::Zero(2, system_size); // A matrix in the Ax = b system 
+        Eigen::MatrixXd b_i = Y * alpha_I0toIk - H_proj * p_IinC; // Right Hand Side (Ax = b) collects known terms (alpha and extrinsic p_IinC)
         if (size_feature == 1) {
           assert(false);
           // Substitute in p_FinI0 = z*bearing_inC0_rotI0 - R_ItoC^T*p_IinC
@@ -394,14 +428,28 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   // Constrained solving |g| = 9.81 constraint
   Eigen::MatrixXd A1 = A.block(0, 0, A.rows(), A.cols() - 3);
   // Eigen::MatrixXd A1A1_inv = (A1.transpose() * A1).inverse();
+  // Compute (A1^T A1)^{-1} efficiently using LLT; used to eliminate feature+velocity unknowns -> solve only for gravity in the constrained optimization, then back-substitute to get the features and velocity.
   Eigen::MatrixXd A1A1_inv = (A1.transpose() * A1).llt().solve(Eigen::MatrixXd::Identity(A1.cols(), A1.cols()));
   Eigen::MatrixXd A2 = A.block(0, A.cols() - 3, A.rows(), 3);
   Eigen::MatrixXd Temp = A2.transpose() * (Eigen::MatrixXd::Identity(A1.rows(), A1.rows()) - A1 * A1A1_inv * A1.transpose());
   Eigen::MatrixXd D = Temp * A2;
   Eigen::MatrixXd d = Temp * b;
-  Eigen::Matrix<double, 7, 1> coeff = InitializerHelper::compute_dongsi_coeff(D, d, params.gravity_mag);
 
-  // Create companion matrix of our polynomial
+  // ========== DONGSI METHOD ==========
+  // Reduce the constrained least-squares problem (||A1 x1 + A2 g - b|| subject to ||g||=g_mag)
+  // to a scalar polynomial in the Lagrange multiplier (Dongsi reduction). The
+  // computed coefficients are used to find candidate lambdas whose real roots
+  // yield candidate gravity vectors g = (D - lambda I)^{-1} d.
+
+  // Il metodo di Dongsi trasforma il problema di trovare il vettore g (con il vincolo ∣g∣=9.81) nella ricerca delle radici di un polinomio di alto grado (solitamente di 4° o 6° grado).
+  // In matematica, trovare le radici di un polinomio (es. aλ^4+bλ^3+cλ^2+dλ+e=0) non è banale per un computer se il grado è alto.
+  // La Companion Matrix (Matrice Compagna) è una matrice costruita usando proprio i coefficienti di quel polinomio.
+  // La proprietà magica: Gli autovalori (eigenvalues) della Companion Matrix sono esattamente le radici del polinomio originale.
+  
+  // create 6 degree polynomial coefficients obtained after removing D and d, which are the velocity and position terms, from the optimization and leaving only lambda (the lagrange multiplier for the gravity magnitude constraint) as unknown. This is the "Dongsi reduction" step.
+  Eigen::Matrix<double, 7, 1> coeff = InitializerHelper::compute_dongsi_coeff(D, d, params.gravity_mag); // DONGSI METHOD
+
+  // Create companion matrix of our polynomial 
   // https://en.wikipedia.org/wiki/Companion_matrix
   assert(coeff(0) == 1);
   Eigen::Matrix<double, 6, 6> companion_matrix = Eigen::Matrix<double, 6, 6>::Zero(coeff.rows() - 1, coeff.rows() - 1);
@@ -417,7 +465,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     return false;
   }
 
-  // Find its eigenvalues (can be complex)
+  // Find its eigenvalues (can be complex) -> they are the roots (radici) of our polynomial, which are the candidate lambdas (lambda = radice reale) for the Lagrange multiplier in the constrained optimization. We will select the best lambda based on how well it satisfies the gravity magnitude constraint.
   Eigen::EigenSolver<Eigen::Matrix<double, 6, 6>> solver(companion_matrix, false);
   if (solver.info() != Eigen::Success) {
     PRINT_ERROR(RED "[init-d]: failed to compute the eigenvalue decomposition!!\n" RESET);
@@ -435,17 +483,25 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   // Eigen::MatrixXd ddt = d * d.transpose();
   for (int i = 0; i < solver.eigenvalues().size(); i++) {
     auto val = solver.eigenvalues()(i);
-    if (val.imag() == 0) {
+    if (val.imag() == 0) { // take only real roots (real lambdas)
       double lambda = val.real();
-      // Eigen::MatrixXd mat = (D - lambda * I_dd) * (D - lambda * I_dd) - 1 / g2 * ddt;
-      // double cost = mat.determinant();
-      Eigen::MatrixXd D_lambdaI_inv = (D - lambda * I_dd).llt().solve(I_dd);
-      Eigen::VectorXd state_grav = D_lambdaI_inv * d;
-      double cost = std::abs(state_grav.norm() - params.gravity_mag);
+      // For each real eigenvalue (candidate lambda) compute g = (D - lambda I)^{-1} d
+      // and score it by how close |g| is to the expected gravity magnitude.
+
+      // Dopo aver eliminato le feature e la velocità dal sistema originale Ax=b, arriviamo a un problema di minimi quadrati vincolato che ha questa forma 
+      // (derivata dal metodo di Dongsi),(D−λI)g=d. Dove:
+      // D: È una matrice 3x3 che contiene le informazioni strutturali rimaste dopo l'eliminazione delle altre incognite.
+      // λ: È il moltiplicatore di Lagrange (una delle radici reali che abbiamo appena trovato).
+      // d: È il vettore dei termini noti rimasti.
+      // I: È la matrice identità 3x3. 
+      // Per trovare g, dovremmo fare: g=(D−λI)^(−1)d.  
+      Eigen::MatrixXd D_lambdaI_inv = (D - lambda * I_dd).llt().solve(I_dd);  // LLT - Cholesky Decomposition
+      Eigen::VectorXd state_grav = D_lambdaI_inv * d; // possible solution, for which we want to compute the norm and see how close it is to the expected gravity magnitude.
+      double cost = std::abs(state_grav.norm() - params.gravity_mag); // we want the lambda which is the closer to the real gravity magnitude; this is the cost we use to select the best lambda among the real roots of the polynomial
       // std::cout << lambda << " - " << cost << " -> " << state_grav.transpose() << std::endl;
       if (!lambda_found || cost < cost_min) {
         lambda_found = true;
-        lambda_min = lambda;
+        lambda_min = lambda; // best lambda
         cost_min = cost;
       }
     }
@@ -458,11 +514,16 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
 
   // Recover our gravity from the constraint!
   // Eigen::MatrixXd D_lambdaI_inv = (D - lambda_min * I_dd).inverse();
-  Eigen::MatrixXd D_lambdaI_inv = (D - lambda_min * I_dd).llt().solve(I_dd);
+  // Compute the selected gravity vector g using the best lambda.
+  Eigen::MatrixXd D_lambdaI_inv = (D - lambda_min * I_dd).llt().solve(I_dd); 
   Eigen::VectorXd state_grav = D_lambdaI_inv * d;
 
-  // Overwrite our state: [features, velocity, gravity]
-  Eigen::VectorXd state_feat_vel = -A1A1_inv * A1.transpose() * A2 * state_grav + A1A1_inv * A1.transpose() * b;
+
+  // now that we have gravity, we can recover the rest of the state (features and velocity) from the original linear system using linear elimination 
+  // (i.e. substituting the gravity value back into the equations to solve for the features and velocity).
+  // Overwrite our state vector X_HAT: [features, velocity, gravity]
+  // Recover feature positions and initial velocity from linear elimination given g.
+  Eigen::VectorXd state_feat_vel = -A1A1_inv * A1.transpose() * A2 * state_grav + A1A1_inv * A1.transpose() * b; // formula to find the features and velocity given the gravity vector, derived from the linear system and the Dongsi reduction.
   Eigen::MatrixXd x_hat = Eigen::MatrixXd::Zero(system_size, 1);
   x_hat.block(0, 0, size_feature * num_features + 3, 1) = state_feat_vel;
   x_hat.block(size_feature * num_features + 3, 0, 3, 1) = state_grav;
@@ -505,6 +566,11 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     }
 
     // Integrate to get the relative to the current timestamp
+    // Compute position and velocity at each camera time relative to I0 using
+    // the recovered initial velocity v_I0 and gravity plus preintegration terms.
+    // The formulas are derived from the IMU kinematic equations: 
+    // p_IkinI0 = v_I0*DT - 0.5*g*DT^2 + alpha (preintegration term that captures the effect of the accelerations between the two poses on the position)
+    // v_IkinI0 = v_I0 - g*DT + beta (preintegration term that captures the effect of the accelerations between the two poses on the velocity)
     Eigen::Vector3d p_IkinI0 = v_I0inI0 * DT - 0.5 * gravity_inI0 * DT * DT + alpha_I0toIk;
     Eigen::Vector3d v_IkinI0 = v_I0inI0 - gravity_inI0 * DT + beta_I0toIk;
 
@@ -526,15 +592,17 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       // double depth = x_hat(size_feature * A_index_features.at(feat.first), 0);
       // p_FinI0 = depth * features_bearings.at(feat.first) - R_ItoC.transpose() * p_IinC;
     } else {
-      p_FinI0 = x_hat.block(size_feature * A_index_features.at(feat.first), 0, 3, 1);
+      p_FinI0 = x_hat.block(size_feature * A_index_features.at(feat.first), 0, 3, 1); //p_FinI0 contains the coordinate of the point p in the first I0 frame
     }
+
+    // Check if feature projects behind any camera; if so, discard it.
     bool is_behind = false;
     for (auto const &camtime : feat.second->timestamps) {
       size_t cam_id = camtime.first;
       Eigen::Vector4d q_ItoC = params.camera_extrinsics.at(cam_id).block(0, 0, 4, 1);
       Eigen::Vector3d p_IinC = params.camera_extrinsics.at(cam_id).block(4, 0, 3, 1);
       Eigen::Vector3d p_FinC0 = quat_2_Rot(q_ItoC) * p_FinI0 + p_IinC;
-      if (p_FinC0(2) < 0) {
+      if (p_FinC0(2) < 0) { // p_FinC0(2) is the depth of the feature in the camera frame; if negative, it means the feature is behind the camera, which is not physically plausible, so we discard this feature from our optimization.
         is_behind = true;
       }
     }
@@ -550,6 +618,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
 
   // Convert our states to be a gravity aligned global frame of reference
   // Here we say that the I0 frame is at 0,0,0 and shared the global origin
+  // rotate states to a gravity-aligned global frame via Gram–Schmidt: we find the rotation that aligns the gravity vector with the z-axis, and we rotate all our states (features, velocity, gravity) with this rotation to get them in the global frame.
   Eigen::Matrix3d R_GtoI0;
   InitializerHelper::gram_schmidt(gravity_inI0, R_GtoI0);
   Eigen::Vector4d q_GtoI0 = rot_2_quat(R_GtoI0);
@@ -569,8 +638,15 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   // ======================================================
   // ======================================================
 
-  // Ceres problem stuff
-  // NOTE: By default the problem takes ownership of the memory
+  // --- Nonlinear MLE refinement (Ceres) ---
+  // The linear closed-form solution (features, v, g) is used as an initial guess
+  // for a full nonlinear maximum likelihood estimation. We build a factor graph
+  // that contains:
+  //  - state blocks per camera time: orientation (quat), position, velocity, gyro/accel biases -> imu state at each camera time
+  //  - IMU preintegration factors between consecutive states (Factor_ImuCPIv1) -> how the states evolve according to the IMU measurements and preintegration
+  //  - visual reprojection factors for each feature observation (Factor_ImageReprojCalib) -> 3D feature positions are projected into the camera and compared to the observed 2D normalized pixel coordinates, with the reprojection error being minimized.
+  // The solver then jointly refines all variables to minimize residuals.
+  // NOTE: the problem takes ownership of parameter memory allocated below.
   ceres::Problem problem;
 
   // Our system states (map from time to index)
@@ -652,7 +728,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     //  ADDING GRAPH STATE / ESTIMATES!
     // ================================================================
 
-    // Load our state variables into our allocated state pointers
+    // Load our state variables into allocated raw arrays that become Ceres parameter blocks
     auto *var_ori = new double[4];
     for (int j = 0; j < 4; j++) {
       var_ori[j] = state_k1(0 + j, 0);
@@ -682,7 +758,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     // NOTE: Thus we need to fix these parameters
     if (map_states.empty()) {
 
-      // Construct state and prior
+      // Construct a prior on the first pose and biases to fix gauge freedom
       Eigen::MatrixXd x_lin = Eigen::MatrixXd::Zero(13, 1);
       for (int j = 0; j < 4; j++) {
         x_lin(0 + j) = var_ori[j];
@@ -710,7 +786,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       factor_params.push_back(var_bias_a);
       x_types.emplace_back("vec3");
 
-      // Append it to the problem
+      // Append the generic prior residual block to the problem (constrains yaw/pos/biases)
       auto *factor_prior = new Factor_GenericPrior(x_lin, x_types, prior_Info, prior_grad);
       problem.AddResidualBlock(factor_prior, nullptr, factor_params);
     }
@@ -741,6 +817,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       factor_params.push_back(ceres_vars_vel.at(map_states.at(timestamp_k1)));
       factor_params.push_back(ceres_vars_bias_a.at(map_states.at(timestamp_k1)));
       factor_params.push_back(ceres_vars_pos.at(map_states.at(timestamp_k1)));
+      // Add an IMU preintegration residual between consecutive states (encodes inertial dynamics)
       auto *factor_imu = new Factor_ImuCPIv1(cpi->DT, gravity, cpi->alpha_tau, cpi->beta_tau, cpi->q_k2tau, cpi->b_a_lin, cpi->b_w_lin,
                                              cpi->J_q, cpi->J_b, cpi->J_a, cpi->H_b, cpi->H_a, cpi->P_meas);
       problem.AddResidualBlock(factor_imu, nullptr, factor_params);
@@ -876,8 +953,8 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
         factor_params.push_back(ceres_vars_calib_cam2imu_ori.at(map_calib_cam2imu.at(cam_id)));
         factor_params.push_back(ceres_vars_calib_cam2imu_pos.at(map_calib_cam2imu.at(cam_id)));
         factor_params.push_back(ceres_vars_calib_cam_intrinsics.at(map_calib_cam.at(cam_id)));
+        // Add reprojection residual (visual measurement) with robust loss to downweight outliers
         auto *factor_pinhole = new Factor_ImageReprojCalib(uv_raw, params.sigma_pix, is_fisheye);
-        // ceres::LossFunction *loss_function = nullptr;
         ceres::LossFunction *loss_function = new ceres::CauchyLoss(1.0);
         problem.AddResidualBlock(factor_pinhole, loss_function, factor_params);
       }
